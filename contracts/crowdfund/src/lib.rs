@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(missing_docs)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
 
@@ -7,15 +8,21 @@ mod test;
 
 // ── Data Types ──────────────────────────────────────────────────────────────
 
+/// Represents the campaign status.
 #[derive(Clone, PartialEq)]
 #[contracttype]
 pub enum Status {
+    /// The campaign is currently active and accepting contributions.
     Active,
+    /// The campaign was successful and goal was met.
     Successful,
+    /// The campaign was refunded because goal was not met.
     Refunded,
+    /// The campaign was cancelled by the creator.
     Cancelled,
 }
 
+/// Campaign statistics for the get_stats view.
 #[derive(Clone)]
 #[contracttype]
 pub struct RoadmapItem {
@@ -23,6 +30,7 @@ pub struct RoadmapItem {
     pub description: String,
 }
 
+/// Represents all storage keys used by the crowdfund contract.
 #[derive(Clone)]
 #[contracttype]
 pub struct CampaignStats {
@@ -76,6 +84,7 @@ pub enum ContractError {
 
 // ── Contract ────────────────────────────────────────────────────────────────
 
+/// The main crowdfund contract implementation.
 #[contract]
 pub struct CrowdfundContract;
 
@@ -425,13 +434,25 @@ impl CrowdfundContract {
 
     /// Returns comprehensive campaign statistics.
     pub fn get_stats(env: Env) -> CampaignStats {
-        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+        let total_raised: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRaised)
+            .unwrap_or(0);
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
-        let contributors: Vec<Address> = env.storage().instance().get(&DataKey::Contributors).unwrap();
+        let contributors: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Contributors)
+            .unwrap();
 
         let progress_bps = if goal > 0 {
-            let raw = (total_raised as i128 * 10_000) / goal;
-            if raw > 10_000 { 10_000 } else { raw as u32 }
+            let raw = (total_raised * 10_000) / goal;
+            if raw > 10_000 {
+                10_000
+            } else {
+                raw as u32
+            }
         } else {
             0
         };
@@ -443,7 +464,11 @@ impl CrowdfundContract {
             let average = total_raised / contributor_count as i128;
             let mut largest = 0i128;
             for contributor in contributors.iter() {
-                let amount: i128 = env.storage().instance().get(&DataKey::Contribution(contributor)).unwrap_or(0);
+                let amount: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Contribution(contributor))
+                    .unwrap_or(0);
                 if amount > largest {
                     largest = amount;
                 }
