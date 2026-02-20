@@ -1,15 +1,12 @@
 #![no_std]
 #![allow(missing_docs)]
 
-//! Crowdfund smart contract built on Soroban.
-//! Provides campaign initialization, contributions, withdrawals, and refunds.
-
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
 
 #[cfg(test)]
 mod test;
 
-// ── Data Keys ───────────────────────────────────────────────────────────────
+// ── Data Types ──────────────────────────────────────────────────────────────
 
 /// Represents the campaign status.
 #[derive(Clone, PartialEq)]
@@ -28,19 +25,9 @@ pub enum Status {
 /// Campaign statistics for the get_stats view.
 #[derive(Clone)]
 #[contracttype]
-pub struct CampaignStats {
-    /// Total amount raised so far.
-    pub total_raised: i128,
-    /// The funding goal.
-    pub goal: i128,
-    /// Progress towards goal in basis points (10000 = 100%).
-    pub progress_bps: u32,
-    /// Number of contributors.
-    pub contributor_count: u32,
-    /// Average contribution amount.
-    pub average_contribution: i128,
-    /// Largest contribution amount.
-    pub largest_contribution: i128,
+pub struct RoadmapItem {
+    pub date: u64,
+    pub description: String,
 }
 
 /// Represents all storage keys used by the crowdfund contract.
@@ -65,12 +52,21 @@ pub enum DataKey {
     Status,
     /// Minimum contribution amount.
     MinContribution,
-    /// Campaign title.
-    Title,
-    /// Campaign description.
-    Description,
-    /// Campaign social links.
-    SocialLinks,
+    /// List of roadmap items with dates and descriptions.
+    Roadmap,
+}
+
+// ── Contract Error ──────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    AlreadyInitialized = 1,
+    CampaignEnded = 2,
+    CampaignStillActive = 3,
+    GoalNotReached = 4,
+    GoalReached = 5,
 }
 
 // ── Contract ────────────────────────────────────────────────────────────────
@@ -99,7 +95,7 @@ impl CrowdfundContract {
     ) {
         // Prevent re-initialization.
         if env.storage().instance().has(&DataKey::Creator) {
-            panic!("already initialized");
+            return Err(ContractError::AlreadyInitialized);
         }
 
         creator.require_auth();
@@ -118,15 +114,20 @@ impl CrowdfundContract {
 
         let empty_contributors: Vec<Address> = Vec::new(&env);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Contributors, &empty_contributors);
+
+        let empty_roadmap: Vec<RoadmapItem> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::Roadmap, &empty_roadmap);
     }
 
     /// Contribute tokens to the campaign.
     ///
     /// The contributor must authorize the call. Contributions are rejected
     /// after the deadline has passed.
-    pub fn contribute(env: Env, contributor: Address, amount: i128) {
+    pub fn contribute(env: Env, contributor: Address, amount: i128) -> Result<(), ContractError> {
         contributor.require_auth();
 
         let min_contribution: i128 = env
@@ -140,7 +141,7 @@ impl CrowdfundContract {
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() > deadline {
-            panic!("campaign has ended");
+            return Err(ContractError::CampaignEnded);
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -150,15 +151,18 @@ impl CrowdfundContract {
         token_client.transfer(&contributor, &env.current_contract_address(), &amount);
 
         // Update the contributor's running total.
+        let contribution_key = DataKey::Contribution(contributor.clone());
         let prev: i128 = env
             .storage()
-            .instance()
-            .get(&DataKey::Contribution(contributor.clone()))
+            .persistent()
+            .get(&contribution_key)
             .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::Contribution(contributor.clone()),
-            &(prev + amount),
-        );
+        env.storage()
+            .persistent()
+            .set(&contribution_key, &(prev + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&contribution_key, 100, 100);
 
         // Update the global total raised.
         let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
@@ -169,15 +173,20 @@ impl CrowdfundContract {
         // Track contributor address if new.
         let mut contributors: Vec<Address> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Contributors)
             .unwrap();
         if !contributors.contains(&contributor) {
-            contributors.push_back(contributor);
+            contributors.push_back(contributor.clone());
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Contributors, &contributors);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Contributors, 100, 100);
         }
+
+        Ok(())
     }
 
     /// Withdraw raised funds — only callable by the creator after the
@@ -193,13 +202,13 @@ impl CrowdfundContract {
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() <= deadline {
-            panic!("campaign is still active");
+            return Err(ContractError::CampaignStillActive);
         }
 
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
         let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
         if total < goal {
-            panic!("goal not reached");
+            return Err(ContractError::GoalNotReached);
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -208,9 +217,13 @@ impl CrowdfundContract {
         token_client.transfer(&env.current_contract_address(), &creator, &total);
 
         env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::Status, &Status::Successful);
+        env.storage().instance().set(&DataKey::Status, &Status::Successful);
+
+        // Emit withdrawal event
+        env.events().publish(
+            ("campaign", "withdrawn"),
+            (creator.clone(), total),
+        );
     }
 
     /// Refund all contributors — callable by anyone after the deadline
@@ -223,13 +236,13 @@ impl CrowdfundContract {
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() <= deadline {
-            panic!("campaign is still active");
+            return Err(ContractError::CampaignStillActive);
         }
 
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
         let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
         if total >= goal {
-            panic!("goal was reached; use withdraw instead");
+            return Err(ContractError::GoalReached);
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -237,21 +250,25 @@ impl CrowdfundContract {
 
         let contributors: Vec<Address> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Contributors)
             .unwrap();
 
         for contributor in contributors.iter() {
+            let contribution_key = DataKey::Contribution(contributor.clone());
             let amount: i128 = env
                 .storage()
-                .instance()
-                .get(&DataKey::Contribution(contributor.clone()))
+                .persistent()
+                .get(&contribution_key)
                 .unwrap_or(0);
             if amount > 0 {
                 token_client.transfer(&env.current_contract_address(), &contributor, &amount);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Contribution(contributor), &0i128);
+                    .persistent()
+                    .set(&contribution_key, &0i128);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&contribution_key, 100, 100);
             }
         }
 
@@ -277,21 +294,25 @@ impl CrowdfundContract {
 
         let contributors: Vec<Address> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Contributors)
             .unwrap();
 
         for contributor in contributors.iter() {
+            let contribution_key = DataKey::Contribution(contributor.clone());
             let amount: i128 = env
                 .storage()
-                .instance()
-                .get(&DataKey::Contribution(contributor.clone()))
+                .persistent()
+                .get(&contribution_key)
                 .unwrap_or(0);
             if amount > 0 {
                 token_client.transfer(&env.current_contract_address(), &contributor, &amount);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::Contribution(contributor), &0i128);
+                    .persistent()
+                    .set(&contribution_key, &0i128);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&contribution_key, 100, 100);
             }
         }
 
@@ -301,69 +322,54 @@ impl CrowdfundContract {
             .set(&DataKey::Status, &Status::Cancelled);
     }
 
-    /// Update campaign metadata (title, description, social links).
-    ///
-    /// Only the creator can update metadata, and only while the campaign is Active.
-    /// All fields are optional - only provided fields will be updated.
-    ///
-    /// # Arguments
-    /// * `title`        – Optional new title.
-    /// * `description` – Optional new description.
-    /// * `socials`     – Optional new social links.
-    pub fn update_metadata(
-        env: Env,
-        title: Option<String>,
-        description: Option<String>,
-        socials: Option<String>,
-    ) {
-        // Check campaign is active.
-        let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
-        if status != Status::Active {
-            panic!("campaign is not active");
-        }
+    // ── View helpers ────────────────────────────────────────────────────
 
-        // Require creator authentication.
+    /// Add a roadmap item to the campaign timeline.
+    ///
+    /// Only the creator can add roadmap items. The date must be in the future
+    /// and the description must not be empty.
+    pub fn add_roadmap_item(env: Env, date: u64, description: String) {
         let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
         creator.require_auth();
 
-        // Track which fields were updated for the event.
-        let mut updated_fields: Vec<Symbol> = Vec::new(&env);
-
-        // Update title if provided.
-        if let Some(new_title) = title {
-            env.storage().instance().set(&DataKey::Title, &new_title);
-            updated_fields.push_back(Symbol::new(&env, "title"));
+        let current_timestamp = env.ledger().timestamp();
+        if date <= current_timestamp {
+            panic!("date must be in the future");
         }
 
-        // Update description if provided.
-        if let Some(new_description) = description {
-            env.storage()
-                .instance()
-                .set(&DataKey::Description, &new_description);
-            updated_fields.push_back(Symbol::new(&env, "description"));
+        if description.is_empty() {
+            panic!("description cannot be empty");
         }
 
-        // Update social links if provided.
-        if let Some(new_socials) = socials {
-            env.storage()
-                .instance()
-                .set(&DataKey::SocialLinks, &new_socials);
-            updated_fields.push_back(Symbol::new(&env, "socials"));
-        }
+        let mut roadmap: Vec<RoadmapItem> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Roadmap)
+            .unwrap_or_else(|| Vec::new(&env));
 
-        // Emit event with the list of updated field names.
+        let item = RoadmapItem {
+            date,
+            description: description.clone(),
+        };
+
+        roadmap.push_back(item.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Roadmap, &roadmap);
+
         env.events().publish(
-            (
-                Symbol::new(&env, "campaign"),
-                Symbol::new(&env, "metadata_updated"),
-            ),
-            updated_fields,
+            ("campaign", "roadmap_item_added"),
+            (date, description),
         );
     }
 
-    // ── View helpers ────────────────────────────────────────────────────
-
-    /// Returns the total amount raised so far.
+    /// Returns the full ordered list of roadmap items.
+    pub fn roadmap(env: Env) -> Vec<RoadmapItem> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Roadmap)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
     pub fn total_raised(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -383,9 +389,10 @@ impl CrowdfundContract {
 
     /// Returns the contribution of a specific address.
     pub fn contribution(env: Env, contributor: Address) -> i128 {
+        let contribution_key = DataKey::Contribution(contributor);
         env.storage()
-            .instance()
-            .get(&DataKey::Contribution(contributor))
+            .persistent()
+            .get(&contribution_key)
             .unwrap_or(0)
     }
 
