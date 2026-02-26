@@ -1,11 +1,17 @@
 #![no_std]
+#![allow(missing_docs)]
+#![allow(clippy::too_many_arguments)]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env,
+    String, Symbol, Vec,
+};
 
 #[cfg(test)]
 mod test;
 
-// ── Data Keys ───────────────────────────────────────────────────────────────
+const CONTRACT_VERSION: u32 = 3;
+const CONTRIBUTION_COOLDOWN: u64 = 60; // 60 seconds cooldown
 
 #[derive(Clone, PartialEq)]
 #[contracttype]
@@ -14,6 +20,20 @@ pub enum Status {
     Successful,
     Refunded,
     Cancelled,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RoadmapItem {
+    pub date: u64,
+    pub description: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PlatformConfig {
+    pub address: Address,
+    pub fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -29,116 +49,151 @@ pub struct CampaignStats {
 
 #[derive(Clone)]
 #[contracttype]
-pub struct PlatformConfig {
-    pub address: Address,
-    pub fee_bps: u32,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct FeeTier {
-    pub threshold: i128,
-    pub fee_bps: u32,
+pub struct CampaignInfo {
+    pub creator: Address,
+    pub token: Address,
+    pub goal: i128,
+    pub deadline: u64,
+    pub total_raised: i128,
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    /// The address of the campaign creator.
     Creator,
-    /// The token used for contributions (e.g. USDC).
     Token,
-    /// The funding goal in the token's smallest unit.
     Goal,
-    /// The deadline as a ledger timestamp.
     Deadline,
-    /// Total amount raised so far.
     TotalRaised,
-    /// Individual contribution by address.
     Contribution(Address),
-    /// List of all contributor addresses.
     Contributors,
-    /// Campaign status (Active, Successful, Refunded).
     Status,
-    /// Minimum contribution amount.
     MinContribution,
-    /// Platform configuration for fee handling.
+    Roadmap,
+    Admin,
+    Title,
+    Description,
+    SocialLinks,
     PlatformConfig,
-    /// Fee tiers for dynamic fee calculation.
-    FeeTiers,
+    /// List of reward tiers (name + min_amount).
+    RewardTiers,
+    /// Individual pledge by address.
+    Pledge(Address),
+    /// List of all pledger addresses.
+    Pledgers,
+    /// Total amount pledged (not yet collected).
+    TotalPledged,
+    /// List of stretch goal milestones.
+    StretchGoals,
+    /// Total amount referred by each referrer address.
+    ReferralTally(Address),
+    /// Optional secondary bonus goal.
+    BonusGoal,
+    /// Optional bonus goal description.
+    BonusGoalDescription,
+    /// Whether a bonus-goal reached event was emitted.
+    BonusGoalReachedEmitted,
+    /// Hard cap for the campaign.
+    HardCap,
+    /// NFT contract address for minting commemorative tokens.
+    NFTContract,
+    /// Last contribution time for rate limiting.
+    LastContributionTime(Address),
 }
 
-// ── Contract ────────────────────────────────────────────────────────────────
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    AlreadyInitialized = 1,
+    CampaignEnded = 2,
+    CampaignStillActive = 3,
+    GoalNotReached = 4,
+    GoalReached = 5,
+    Overflow = 6,
+    InvalidHardCap = 7,
+    HardCapExceeded = 8,
+    RateLimitExceeded = 9,
+    ContractPaused = 10,
+    InvalidLimit = 11,
+}
+
+#[contractclient(name = "NftContractClient")]
+pub trait NftContract {
+    fn mint(env: Env, to: Address) -> u128;
+}
 
 #[contract]
 pub struct CrowdfundContract;
 
 #[contractimpl]
 impl CrowdfundContract {
-    /// Initializes a new crowdfunding campaign.
-    ///
-    /// # Arguments
-    /// * `creator`          – The campaign creator's address.
-    /// * `token`            – The token contract address used for contributions.
-    /// * `goal`             – The funding goal (in the token's smallest unit).
-    /// * `deadline`         – The campaign deadline as a ledger timestamp.
-    /// * `min_contribution` – The minimum contribution amount.
-    /// * `platform_config`  – Optional platform configuration (address and fee in basis points).
-    /// * `fee_tiers`        – Optional fee tiers for dynamic fee calculation.
     pub fn initialize(
         env: Env,
+        admin: Address,
         creator: Address,
         token: Address,
         goal: i128,
         deadline: u64,
         min_contribution: i128,
         platform_config: Option<PlatformConfig>,
-        fee_tiers: Option<Vec<FeeTier>>,
-    ) {
-        // Prevent re-initialization.
+        bonus_goal: Option<i128>,
+        bonus_goal_description: Option<String>,
+        hard_cap: Option<i128>,
+    ) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Creator) {
-            panic!("already initialized");
+            return Err(ContractError::AlreadyInitialized);
         }
 
         creator.require_auth();
 
-        // Validate platform fee if provided.
         if let Some(ref config) = platform_config {
             if config.fee_bps > 10_000 {
                 panic!("platform fee cannot exceed 100%");
             }
+            env.storage()
+                .instance()
+                .set(&DataKey::PlatformConfig, config);
         }
 
-        // Validate and store fee tiers if provided.
-        if let Some(ref tiers) = fee_tiers {
-            if !tiers.is_empty() {
-                // Validate each tier's fee_bps.
-                for tier in tiers.iter() {
-                    if tier.fee_bps > 10_000 {
-                        panic!("fee tier fee_bps cannot exceed 10000");
-                    }
-                }
+        let hard_cap_value = hard_cap.unwrap_or(goal * 2); // Default to 2x goal
+        if hard_cap_value < goal {
+            return Err(ContractError::InvalidHardCap);
+        }
 
-                // Validate tiers are ordered by threshold ascending.
-                for i in 1..tiers.len() {
-                    let prev = tiers.get(i - 1).unwrap();
-                    let curr = tiers.get(i).unwrap();
-                    if curr.threshold <= prev.threshold {
-                        panic!("fee tiers must be ordered by threshold ascending");
-                    }
-                }
-
-                env.storage().instance().set(&DataKey::FeeTiers, tiers);
+        if let Some(bg) = bonus_goal {
+            if bg <= goal {
+                panic!("bonus goal must be greater than primary goal");
             }
+            env.storage().instance().set(&DataKey::BonusGoal, &bg);
+        }
+
+        if let Some(bg_description) = bonus_goal_description {
+            env.storage()
+                .instance()
+                .set(&DataKey::BonusGoalDescription, &bg_description);
         }
 
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Goal, &goal);
+        env.storage().instance().set(&DataKey::HardCap, &hard_cap_value);
         env.storage().instance().set(&DataKey::Deadline, &deadline);
-        env.storage().instance().set(&DataKey::MinContribution, &min_contribution);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinContribution, &min_contribution);
+        if let Some(config) = platform_config {
+            env.storage()
+                .instance()
+                .set(&DataKey::PlatformConfig, &config);
+        }
         env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage().instance().set(&DataKey::Status, &Status::Active);
+        env.storage()
+            .instance()
+            .set(&DataKey::BonusGoalReachedEmitted, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::Status, &Status::Active);
 
         // Store platform config if provided.
         if let Some(config) = platform_config {
@@ -147,74 +202,275 @@ impl CrowdfundContract {
 
         let empty_contributors: Vec<Address> = Vec::new(&env);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Contributors, &empty_contributors);
+
+        let empty_roadmap: Vec<RoadmapItem> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::Roadmap, &empty_roadmap);
+
+        Ok(())
+    }
+
+    pub fn set_nft_contract(env: Env, creator: Address, nft_contract: Address) {
+        let stored_creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
+        if creator != stored_creator {
+            panic!("not authorized");
+        }
+
+        creator.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::NFTContract, &nft_contract);
     }
 
     /// Contribute tokens to the campaign.
     ///
     /// The contributor must authorize the call. Contributions are rejected
     /// after the deadline has passed.
-    pub fn contribute(env: Env, contributor: Address, amount: i128) {
-        contributor.require_auth();
+    pub fn contribute(
+        env: Env,
+        contributor: Address,
+        amount: i128,
+        referral: Option<Address>,
+    ) -> Result<(), ContractError> {
+        // ── Rate limiting: enforce cooldown between contributions ──
+        let now = env.ledger().timestamp();
+        let last_time_key = DataKey::LastContributionTime(contributor.clone());
+        if let Some(last_time) = env.storage().persistent().get::<_, u64>(&last_time_key) {
+            if now < last_time + CONTRIBUTION_COOLDOWN {
+                return Err(ContractError::RateLimitExceeded);
+            }
+        }
 
-        let min_contribution: i128 = env.storage().instance().get(&DataKey::MinContribution).unwrap();
+        let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
+        if status != Status::Active {
+            panic!("campaign is not active");
+        }
+
+        let min_contribution: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContribution)
+            .unwrap();
         if amount < min_contribution {
             panic!("amount below minimum");
         }
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() > deadline {
-            panic!("campaign has ended");
+            return Err(ContractError::CampaignEnded);
+        }
+
+        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&contributor, &env.current_contract_address(), &amount);
+
+        let contribution_key = DataKey::Contribution(contributor.clone());
+        let previous_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&contribution_key, &(previous_amount + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&contribution_key, 100, 100);
+
+        let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRaised, &(total + amount));
+
+        let mut contributors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contributors)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !contributors.contains(&contributor) {
+            contributors.push_back(contributor);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Contributors, &contributors);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Contributors, 100, 100);
+        }
+
+        // Emit contribution event
+        env.events().publish(
+            ("campaign", "contributed"),
+            (contributor.clone(), amount),
+        );
+
+        // Update referral tally if referral provided
+        if let Some(referrer) = referral {
+            if referrer != contributor {
+                let referral_key = DataKey::ReferralTally(referrer.clone());
+                let current_tally: i128 =
+                    env.storage().persistent().get(&referral_key).unwrap_or(0);
+
+                let new_tally = current_tally
+                    .checked_add(amount)
+                    .ok_or(ContractError::Overflow)?;
+
+                env.storage().persistent().set(&referral_key, &new_tally);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&referral_key, 100, 100);
+
+                // Emit referral event
+                env.events().publish(
+                    ("campaign", "referral"),
+                    (referrer, contributor, amount),
+                );
+            }
+        }
+
+        // Update last contribution time for rate limiting
+        env.storage().persistent().set(&last_time_key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&last_time_key, 100, 100);
+
+        Ok(())
+    }
+
+    /// Pledge tokens to the campaign without transferring them immediately.
+    ///
+    /// The pledger must authorize the call. Pledges are recorded off-chain
+    /// and only collected if the goal is met after the deadline.
+    pub fn pledge(env: Env, pledger: Address, amount: i128) -> Result<(), ContractError> {
+        pledger.require_auth();
+
+        let min_contribution: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContribution)
+            .unwrap();
+        if amount < min_contribution {
+            panic!("amount below minimum");
+        }
+
+        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
+        if env.ledger().timestamp() > deadline {
+            return Err(ContractError::CampaignEnded);
+        }
+
+        // Update the pledger's running total.
+        let pledge_key = DataKey::Pledge(pledger.clone());
+        let prev: i128 = env.storage().persistent().get(&pledge_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&pledge_key, &(prev + amount));
+        env.storage().persistent().extend_ttl(&pledge_key, 100, 100);
+
+        // Update the global total pledged.
+        let total_pledged: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPledged)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalPledged, &(total_pledged + amount));
+
+        // Track pledger address if new.
+        let mut pledgers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pledgers)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !pledgers.contains(&pledger) {
+            pledgers.push_back(pledger.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Pledgers, &pledgers);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Pledgers, 100, 100);
+        }
+
+        // Emit pledge event
+        env.events()
+            .publish(("campaign", "pledged"), (pledger, amount));
+
+        Ok(())
+    }
+
+    /// Collect all pledges after the deadline when the goal is met.
+    ///
+    /// This function transfers tokens from all pledgers to the contract.
+    /// Only callable after the deadline and when the combined total of
+    /// contributions and pledges meets or exceeds the goal.
+    pub fn collect_pledges(env: Env) -> Result<(), ContractError> {
+        let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
+        if status != Status::Active {
+            panic!("campaign is not active");
+        }
+
+        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
+        if env.ledger().timestamp() <= deadline {
+            return Err(ContractError::CampaignStillActive);
+        }
+
+        let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
+        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
+        let total_pledged: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPledged)
+            .unwrap_or(0);
+
+        // Check if combined total meets the goal
+        if total_raised + total_pledged < goal {
+            return Err(ContractError::GoalNotReached);
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_address);
 
-        // Transfer tokens from the contributor to this contract.
-        token_client.transfer(
-            &contributor,
-            &env.current_contract_address(),
-            &amount,
-        );
-
-        // Update the contributor's running total.
-        let prev: i128 = env
+        let pledgers: Vec<Address> = env
             .storage()
-            .instance()
-            .get(&DataKey::Contribution(contributor.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::Contribution(contributor.clone()), &(prev + amount));
+            .persistent()
+            .get(&DataKey::Pledgers)
+            .unwrap_or_else(|| Vec::new(&env));
 
-        // Update the global total raised.
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalRaised)
-            .unwrap();
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalRaised, &(total + amount));
+        // Collect pledges from all pledgers
+        for pledger in pledgers.iter() {
+            let pledge_key = DataKey::Pledge(pledger.clone());
+            let amount: i128 = env.storage().persistent().get(&pledge_key).unwrap_or(0);
+            if amount > 0 {
+                // Transfer tokens from pledger to contract
+                token_client.transfer(&pledger, &env.current_contract_address(), &amount);
 
-        // Track contributor address if new.
-        let mut contributors: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Contributors)
-            .unwrap();
-        if !contributors.contains(&contributor) {
-            contributors.push_back(contributor);
-            env.storage()
-                .instance()
-                .set(&DataKey::Contributors, &contributors);
+                // Clear the pledge
+                env.storage().persistent().set(&pledge_key, &0i128);
+                env.storage().persistent().extend_ttl(&pledge_key, 100, 100);
+            }
         }
+
+        // Update total raised to include collected pledges
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRaised, &(total_raised + total_pledged));
+
+        // Reset total pledged
+        env.storage().instance().set(&DataKey::TotalPledged, &0i128);
+
+        // Emit pledges collected event
+        env.events()
+            .publish(("campaign", "pledges_collected"), total_pledged);
+
+        Ok(())
     }
 
-    /// Withdraw raised funds — only callable by the creator after the
-    /// deadline, and only if the goal has been met.
-    pub fn withdraw(env: Env) {
+    pub fn withdraw(env: Env) -> Result<(), ContractError> {
         let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
         if status != Status::Active {
             panic!("campaign is not active");
@@ -225,35 +481,32 @@ impl CrowdfundContract {
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() <= deadline {
-            panic!("campaign is still active");
+            return Err(ContractError::CampaignStillActive);
         }
 
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
         let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
         if total < goal {
-            panic!("goal not reached");
+            return Err(ContractError::GoalNotReached);
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_address);
 
-        // Calculate and transfer platform fee if configured.
-        let platform_config: Option<PlatformConfig> = env.storage().instance().get(&DataKey::PlatformConfig);
-        let fee_tiers: Option<Vec<FeeTier>> = env.storage().instance().get(&DataKey::FeeTiers);
+        let platform_config: Option<PlatformConfig> =
+            env.storage().instance().get(&DataKey::PlatformConfig);
 
         let creator_payout = if let Some(config) = platform_config {
-            let fee = if let Some(tiers) = fee_tiers {
-                // Use tiered fee calculation.
-                Self::calculate_tiered_fee(&env, total, &tiers)
-            } else {
-                // Fall back to flat fee.
-                total * config.fee_bps as i128 / 10_000
-            };
+            let fee = total
+                .checked_mul(config.fee_bps as i128)
+                .expect("fee calculation overflow")
+                .checked_div(10_000)
+                .expect("fee division by zero");
 
-            // Transfer fee to platform.
             token_client.transfer(&env.current_contract_address(), &config.address, &fee);
-
-            total - fee
+            env.events()
+                .publish(("campaign", "fee_transferred"), (&config.address, fee));
+            total.checked_sub(fee).expect("creator payout underflow")
         } else {
             total
         };
@@ -261,41 +514,53 @@ impl CrowdfundContract {
         token_client.transfer(&env.current_contract_address(), &creator, &creator_payout);
 
         env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage().instance().set(&DataKey::Status, &Status::Successful);
-    }
+        env.storage()
+            .instance()
+            .set(&DataKey::Status, &Status::Successful);
 
-    /// Calculate tiered fee based on total raised and fee tiers.
-    fn calculate_tiered_fee(_env: &Env, total: i128, tiers: &Vec<FeeTier>) -> i128 {
-        let mut fee = 0i128;
-        let mut prev_threshold = 0i128;
+        // Mint one commemorative NFT per eligible contributor after successful payout.
+        if let Some(nft_contract) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::NFTContract)
+        {
+            let nft_client = NftContractClient::new(&env, &nft_contract);
+            let contributors: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Contributors)
+                .unwrap_or_else(|| Vec::new(&env));
 
-        for tier in tiers.iter() {
-            if total <= prev_threshold {
-                break;
+            for contributor in contributors.iter() {
+                let amount: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Contribution(contributor.clone()))
+                    .unwrap_or(0);
+
+                // Only mint for contributors with a non-zero stake.
+                if amount > 0 {
+                    let token_id = nft_client.mint(&contributor);
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "campaign"),
+                            Symbol::new(&env, "nft_minted"),
+                        ),
+                        (contributor, token_id),
+                    );
+                }
             }
-
-            let portion_end = if total < tier.threshold { total } else { tier.threshold };
-            let portion = portion_end - prev_threshold;
-            let portion_fee = portion * tier.fee_bps as i128 / 10_000;
-
-            fee += portion_fee;
-            prev_threshold = tier.threshold;
         }
 
-        // Apply the last tier's rate to any amount above the highest threshold.
-        if total > prev_threshold && !tiers.is_empty() {
-            let last_tier = tiers.get(tiers.len() - 1).unwrap();
-            let remaining = total - prev_threshold;
-            let remaining_fee = remaining * last_tier.fee_bps as i128 / 10_000;
-            fee += remaining_fee;
-        }
+        env.events()
+            .publish(("campaign", "withdrawn"), (creator.clone(), total));
 
-        fee
+        Ok(())
     }
 
-    /// Refund all contributors — callable by anyone after the deadline
-    /// if the goal was **not** met.
-    pub fn refund(env: Env) {
+    pub fn refund_single(env: Env, contributor: Address) -> Result<(), ContractError> {
+        contributor.require_auth();
+
         let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
         if status != Status::Active {
             panic!("campaign is not active");
@@ -303,91 +568,83 @@ impl CrowdfundContract {
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() <= deadline {
-            panic!("campaign is still active");
+            return Err(ContractError::CampaignStillActive);
         }
 
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
         let total: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap();
         if total >= goal {
-            panic!("goal was reached; use withdraw instead");
+            return Err(ContractError::GoalReached);
+        }
+
+        let contribution_key = DataKey::Contribution(contributor.clone());
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+
+        if amount == 0 {
+            return Ok(());
         }
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &contributor, &amount);
 
-        let contributors: Vec<Address> = env
-            .storage()
+        env.storage().persistent().set(&contribution_key, &0i128);
+        env.storage()
+            .persistent()
+            .extend_ttl(&contribution_key, 100, 100);
+
+        env.storage()
             .instance()
-            .get(&DataKey::Contributors)
-            .unwrap();
+            .set(&DataKey::TotalRaised, &(total - amount));
 
-        for contributor in contributors.iter() {
-            let amount: i128 = env
-                .storage()
+        if total - amount == 0 {
+            env.storage()
                 .instance()
-                .get(&DataKey::Contribution(contributor.clone()))
-                .unwrap_or(0);
-            if amount > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &contributor,
-                    &amount,
-                );
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Contribution(contributor), &0i128);
-            }
+                .set(&DataKey::Status, &Status::Refunded);
         }
 
-        env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage().instance().set(&DataKey::Status, &Status::Refunded);
+        Ok(())
     }
 
-    /// Cancel the campaign and refund all contributors — callable only by
-    /// the creator while the campaign is still Active.
-    pub fn cancel(env: Env) {
-        let status: Status = env.storage().instance().get(&DataKey::Status).unwrap();
-        if status != Status::Active {
-            panic!("campaign is not active");
-        }
-
+    pub fn add_roadmap_item(env: Env, date: u64, description: String) {
         let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
         creator.require_auth();
 
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_address);
-
-        let contributors: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Contributors)
-            .unwrap();
-
-        for contributor in contributors.iter() {
-            let amount: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::Contribution(contributor.clone()))
-                .unwrap_or(0);
-            if amount > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &contributor,
-                    &amount,
-                );
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Contribution(contributor), &0i128);
-            }
+        if date <= env.ledger().timestamp() {
+            panic!("date must be in the future");
         }
 
-        env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage().instance().set(&DataKey::Status, &Status::Cancelled);
+        if description.is_empty() {
+            panic!("description cannot be empty");
+        }
+
+        let mut roadmap: Vec<RoadmapItem> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Roadmap)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        roadmap.push_back(RoadmapItem {
+            date,
+            description: description.clone(),
+        });
+
+        env.storage().instance().set(&DataKey::Roadmap, &roadmap);
+        env.events()
+            .publish(("campaign", "roadmap_item_added"), (date, description));
     }
 
-    // ── View helpers ────────────────────────────────────────────────────
+    pub fn roadmap(env: Env) -> Vec<RoadmapItem> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Roadmap)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 
-    /// Returns the total amount raised so far.
     pub fn total_raised(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -395,38 +652,76 @@ impl CrowdfundContract {
             .unwrap_or(0)
     }
 
-    /// Returns the funding goal.
     pub fn goal(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::Goal).unwrap()
     }
 
-    /// Returns the campaign deadline.
     pub fn deadline(env: Env) -> u64 {
         env.storage().instance().get(&DataKey::Deadline).unwrap()
     }
 
-    /// Returns the contribution of a specific address.
     pub fn contribution(env: Env, contributor: Address) -> i128 {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Contribution(contributor))
             .unwrap_or(0)
     }
 
-    /// Returns the minimum contribution amount.
     pub fn min_contribution(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::MinContribution).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::MinContribution)
+            .unwrap()
     }
 
-    /// Returns comprehensive campaign statistics.
-    pub fn get_stats(env: Env) -> CampaignStats {
-        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+    pub fn creator(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Creator).unwrap()
+    }
+
+    pub fn nft_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NFTContract)
+    }
+
+    pub fn get_campaign_info(env: Env) -> CampaignInfo {
+        let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
-        let contributors: Vec<Address> = env.storage().instance().get(&DataKey::Contributors).unwrap();
+        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
+        let total_raised: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRaised)
+            .unwrap_or(0);
+
+        CampaignInfo {
+            creator,
+            token,
+            goal,
+            deadline,
+            total_raised,
+        }
+    }
+
+    pub fn get_stats(env: Env) -> CampaignStats {
+        let total_raised: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRaised)
+            .unwrap_or(0);
+        let goal: i128 = env.storage().instance().get(&DataKey::Goal).unwrap();
+        let contributors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contributors)
+            .unwrap_or_else(|| Vec::new(&env));
 
         let progress_bps = if goal > 0 {
-            let raw = (total_raised as i128 * 10_000) / goal;
-            if raw > 10_000 { 10_000 } else { raw as u32 }
+            let raw = (total_raised * 10_000) / goal;
+            if raw > 10_000 {
+                10_000
+            } else {
+                raw as u32
+            }
         } else {
             0
         };
@@ -438,7 +733,11 @@ impl CrowdfundContract {
             let average = total_raised / contributor_count as i128;
             let mut largest = 0i128;
             for contributor in contributors.iter() {
-                let amount: i128 = env.storage().instance().get(&DataKey::Contribution(contributor)).unwrap_or(0);
+                let amount: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Contribution(contributor))
+                    .unwrap_or(0);
                 if amount > largest {
                     largest = amount;
                 }
@@ -456,8 +755,43 @@ impl CrowdfundContract {
         }
     }
 
-    /// Returns the configured fee tiers.
-    pub fn fee_tiers(env: Env) -> Vec<FeeTier> {
-        env.storage().instance().get(&DataKey::FeeTiers).unwrap_or_else(|| Vec::new(&env))
+    pub fn title(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Title)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
+
+    pub fn description(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Description)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
+
+    pub fn socials(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::SocialLinks)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
+
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
+
+    /// Returns the token contract address used for contributions.
+    pub fn token(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Token).unwrap()
+    }
+
+    /// Returns the number of unique contributors.
+    pub fn contributor_count(env: Env) -> u32 {
+        let contributors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contributors)
+            .unwrap_or_else(|| Vec::new(&env));
+        contributors.len()
     }
 }
