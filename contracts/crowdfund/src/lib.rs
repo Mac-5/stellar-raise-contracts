@@ -3,7 +3,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, IntoVal, String, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, token, Address, Env, IntoVal, String,
+    Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -11,13 +12,6 @@ mod test;
 
 const CONTRACT_VERSION: u32 = 3;
 const CONTRIBUTION_COOLDOWN: u64 = 60; // 60 seconds cooldown
-
-/// Contract version constant.
-///
-/// This constant must be manually incremented with every contract upgrade
-/// (see Issue #38). External tools use this to detect logic changes at a
-/// given contract address.
-const CONTRACT_VERSION: u32 = 1;
 
 // ── Data Types ──────────────────────────────────────────────────────────────
 
